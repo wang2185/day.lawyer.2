@@ -1,14 +1,319 @@
-// ---------- DayLawyer (Part 2/2) ----------
+// ---------- DayLawyer (Part 1/2) ----------
+// Concatenate this file with daylawyer_part2.tsx to get a single TSX.
+// Save as src/components/daylawyer_full.tsx (after concatenation) and import with Next.js CSR (ssr:false).
 'use client';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, Calendar as CalIcon } from 'lucide-react';
-import {
-  Shell, useHashRoute, useAuth, PageHome, PageSignup, PageAuth, PageProfile, PageSubscribe,
-  isBrowser, win, ymd, hm, nowKST, setHour, addDays, within, hoursDiff, toGCalDateTime,
-  isWeekend, isHoliday, useKRHolidays, buildICS, downloadICS, formatKRW,
-  PLANS, PLAN_HOURS, TOPUP_RATE, storage, USERS_KEY, getCredits, setCredits, addCredits,
-  NicepayTopupForm, notify
-} from './daylawyer_part1'; // If bundler complains, concatenate files instead.
+import { motion } from 'framer-motion';
+import { Home, CreditCard, User2, Plus, LogOut, LogIn, MessageSquare, Shield, CheckCircle2, ChevronRight, ChevronLeft, Calendar as CalIcon, FileText } from 'lucide-react';
+
+/** FEATURES (fulfilled across Part1+Part2)
+ * - Hash routing (SSR-safe), no direct window usage without guards
+ * - Auth: signup(name/phone/email/password), login, profile edit
+ * - Subscribe: 3 plans (₩110,000/₩990,000/₩3,300,000), NICEPAY MID=winslaw00m, annual
+ * - Credits: seeded by plan (12/60/144h), consult completion consumes 1h, admin +/- adjust, top-up by hour (basic 200k/h, pro 50k/h, elite 30k/h)
+ * - Consult calendar: KR holidays + weekends excluded, 1h slots, 1h lead time, overlap guard, ICS/GCal export
+ * - Admin: member list, subscription & credit view, consult requests list with ‘확정/확정취소/완료/삭제’, blocks panel, month/quarter CSV
+ * - Reminders: midnight & 1h before (notify hooks)
+ * - NICEPAY backend endpoints (placeholders): /api/payments/nicepay/*
+ */
+
+// ---------- SSR guards & helpers ----------
+const isBrowser = typeof window !== 'undefined';
+const win = () => (isBrowser ? window : ({} as any));
+const nowKST = () => new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+const toTZ = (d: any, tz='Asia/Seoul') => new Date(new Date(d).toLocaleString('en-US', { timeZone: tz }));
+const ymd = (d:any) => { const dt=toTZ(d); return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`; };
+const hm = (d:any) => { const dt=toTZ(d); return `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}`; };
+const setHour = (d:any, h:number, m=0) => { const dt=toTZ(d); dt.setHours(h,m,0,0); return dt; };
+const addDays = (d:any, n:number) => { const dt=toTZ(d); dt.setDate(dt.getDate()+n); return dt; };
+const hoursDiff = (a:any,b:any)=> (toTZ(a).getTime()-toTZ(b).getTime())/(1000*60*60);
+const within = (s1:any,e1:any,s2:any,e2:any)=> Math.max(toTZ(s1).getTime(),toTZ(s2).getTime()) < Math.min(toTZ(e1).getTime(),toTZ(e2).getTime());
+const toGCalDateTime = (date:any) => { const d=new Date(date); const z=new Date(d.getTime()-d.getTimezoneOffset()*60000); const p=(x:number)=>String(x).padStart(2,'0'); return `${z.getUTCFullYear()}${p(z.getUTCMonth()+1)}${p(z.getUTCDate())}T${p(z.getUTCHours())}${p(z.getUTCMinutes())}00Z`; };
+const formatKRW = (n:number)=> (n||0).toLocaleString('ko-KR');
+const normalizePhone = (p:string)=> (p||'').replace(/[^0-9]/g,'');
+
+// ---------- storage ----------
+const storage = {
+  get<T=any>(k:string, fb:any=null):T { try{ if(!isBrowser) return fb; const v=localStorage.getItem(k); return v? JSON.parse(v): fb; }catch{return fb;} },
+  set(k:string, v:any){ try{ if(!isBrowser) return; localStorage.setItem(k, JSON.stringify(v)); }catch{} },
+  del(k:string){ try{ if(!isBrowser) return; localStorage.removeItem(k); }catch{} },
+};
+
+// ---------- network utils ----------
+async function safeFetch(url:string, init:any={}, timeoutMs=6000){
+  const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{ const res=await fetch(url,{...init, signal:ctrl.signal}); return res; } finally{ clearTimeout(t); }
+}
+async function notify(path:string, payload:any){
+  try{ await safeFetch(`/api/notify/${path}`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}, 5000); }catch{ /* noop */ }
+}
+
+// ---------- holidays (KR) ----------
+const isWeekend = (d:any)=>{ const day=toTZ(d).getDay(); return day===0||day===6; };
+const isHoliday = (d:any, list:string[]=[])=> list.includes(ymd(d));
+function useKRHolidays(year:number){
+  const [days, setDays] = useState<string[]>(storage.get(`holidays:${year}`, []));
+  useEffect(()=>{
+    let on=true;
+    (async()=>{
+      try{
+        const r=await safeFetch(`/api/holidays?year=${year}&country=KR`, {}, 6000);
+        if(r && (r as Response).ok){ const arr=await (r as Response).json(); if(on){ setDays(arr); storage.set(`holidays:${year}`,arr);} }
+        else if(on){ setDays(d=>d.length?d:[`${year}-01-01`]); }
+      }catch{ if(on){ setDays(d=>d.length?d:[`${year}-01-01`]); } }
+    })();
+    return ()=>{ on=false; };
+  },[year]);
+  return days;
+}
+
+// ---------- routing ----------
+function useHashRoute(){
+  const initial = isBrowser? (win().location.hash.replace('#','')||'/') : '/';
+  const [route,setRoute] = useState<string>(initial);
+  useEffect(()=>{
+    if(!isBrowser) return;
+    const on=()=>setRoute(win().location.hash.replace('#','')||'/');
+    window.addEventListener('hashchange', on); return ()=>window.removeEventListener('hashchange', on);
+  },[]);
+  const push=(path:string)=>{ storage.set('route:prev', route); if(isBrowser) win().location.hash=path; };
+  return { route, push };
+}
+
+// ---------- auth ----------
+type TUser = { id:string; name:string; phone:string; email:string; password:string; plan?:string|null };
+const USERS_KEY='auth:users';
+function useAuth(){
+  const [user,setUser]=useState<TUser|null>(()=>storage.get('auth:user',null));
+  const [token,setToken]=useState<string|null>(()=>storage.get('auth:token',null));
+  const users=()=> storage.get<TUser[]>(USERS_KEY,[]);
+  const find=(email:string)=> users().find(u=>u.email===email);
+  const login=(email:string,pw:string)=>{
+    if(!email||!pw||pw.length<6) throw new Error('이메일/비밀번호를 확인하세요(비밀번호 6자 이상).');
+    const u=find(email); if(!u||u.password!==pw) throw new Error('계정이 없거나 비밀번호 불일치.');
+    const t='demo.'+(isBrowser?btoa(email):'token')+'.token'; setUser(u); setToken(t);
+    storage.set('auth:user',u); storage.set('auth:token',t);
+  };
+  const logout=()=>{ setUser(null); setToken(null); storage.del('auth:user'); storage.del('auth:token'); };
+  const update=(patch:Partial<TUser>)=>{ if(!user) return; const next={...user,...patch}; setUser(next); storage.set('auth:user',next); storage.set(USERS_KEY, users().map(u=>u.email===next.email?next:u)); };
+  const register=({name,phone,email,password}:{name:string;phone:string;email:string;password:string;})=>{
+    if(!name||!phone||!email||!password) throw new Error('모든 필드를 입력하세요.');
+    if(password.length<6) throw new Error('비밀번호는 6자 이상.');
+    if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('이메일 형식 오류.');
+    const p=normalizePhone(phone); if(!(p.startsWith('010')&&p.length===11)) throw new Error('휴대폰은 010으로 시작하는 11자리.');
+    const arr=users(); if(arr.find(u=>u.email===email)) throw new Error('이미 가입된 이메일.');
+    const u:{id:string}&TUser={id:'u_'+Date.now(), name, phone:p, email, password, plan: storage.get('user:plan', null)} as any;
+    storage.set(USERS_KEY,[...arr,u]); return u;
+  };
+  return { user, token, login, logout, update, register };
+}
+
+// ---------- plans & credits ----------
+const PLANS = [
+  { id:'basic', name:'베이직', priceKRW:110000, badge:'입문형' },
+  { id:'pro', name:'프로', priceKRW:990000, badge:'추천' },
+  { id:'elite', name:'엘리트', priceKRW:3300000, badge:'최다 혜택' },
+] as const;
+const PLAN_HOURS: Record<string, number> = { basic:12, pro:60, elite:144 };
+const TOPUP_RATE: Record<string, number> = { basic:200000, pro:50000, elite:30000 };
+
+const CREDITS_KEY = 'credits:byUser';
+function getCredits(email?:string|null){ if(!email) return 0; const map = storage.get<Record<string,number>>(CREDITS_KEY, {}); return map[email]||0; }
+function setCredits(email:string, hours:number){ const map = storage.get<Record<string,number>>(CREDITS_KEY, {}); map[email]=Math.max(0, Math.round(hours)); storage.set(CREDITS_KEY, map); }
+function addCredits(email:string, delta:number){ setCredits(email, getCredits(email)+delta); }
+
+// ---------- ICS ----------
+function buildICS({title,start,end,description='',location='Law Firm Wins'}:{title:string;start:any;end:any;description?:string;location?:string;}){
+  const s=toGCalDateTime(start), e=toGCalDateTime(end); const desc=(description||'').replace(/\n/g,'\\n');
+  return `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//DayLawyer//KR//
+BEGIN:VEVENT
+UID:${Date.now()}@daylawyer
+DTSTAMP:${s}
+DTSTART:${s}
+DTEND:${e}
+SUMMARY:${title}
+DESCRIPTION:${desc}
+LOCATION:${location}
+END:VEVENT
+END:VCALENDAR`;
+}
+function downloadICS(args:any){
+  const ics=buildICS(args); const blob=new Blob([ics],{type:'text/calendar'}); const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=`daylawyer_${ymd(args.start)}_${hm(args.start)}.ics`; a.click(); URL.revokeObjectURL(url);
+}
+
+// ---------- Shell ----------
+function Shell({children,route,push,auth}:{children:any;route:string;push:(p:string)=>void;auth:any}){
+  const { user }=auth;
+  const Menu=()=> (
+    <nav className="flex flex-wrap gap-2 text-sm">
+      {[
+        ['/', '홈', <Home className="w-4 h-4" key="h"/>],
+        ['/subscribe', '서비스구독', <CreditCard className="w-4 h-4" key="c"/>],
+        [user?'/profile':'/signup', user?'회원정보':'회원가입', <User2 className="w-4 h-4" key="u"/>],
+        [user?'/logout':'/login', user?'로그아웃':'로그인', user?<LogOut className="w-4 h-4" key="o"/>:<LogIn className="w-4 h-4" key="i"/>],
+        ['/consult','상담', <MessageSquare className="w-4 h-4" key="m"/>],
+        ['/admin','관리자', <Shield className="w-4 h-4" key="a"/>],
+      ].map(([to,label,icon])=>(
+        <button key={String(to)} onClick={()=>push(String(to))} className={`px-3 py-2 rounded-xl border flex items-center gap-2 ${route===to?'bg-black text-white':'hover:bg-slate-50'}`}>{icon}{label}</button>
+      ))}
+    </nav>
+  );
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white">
+      <header className="border-b sticky top-0 bg-white z-10">
+        <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-2"><Shield className="w-6 h-6"/><div className="font-bold">DayLawyer</div></div><Menu/>
+        </div>
+      </header>
+      <main className="max-w-6xl mx-auto px-4 py-6">{children}</main>
+      <footer className="border-t py-6 text-center text-xs text-slate-500">© {new Date().getFullYear()} Wins Law</footer>
+    </div>
+  );
+}
+
+// ---------- Pages (Home / Signup / Login / Profile / Subscribe) ----------
+function PageHome({push,auth}:{push:(p:string)=>void;auth:any}){
+  const {user}=auth;
+  return (
+    <div className="grid lg:grid-cols-2 gap-8 items-center">
+      <motion.div initial={{opacity:0, y:8}} animate={{opacity:1, y:0}} transition={{duration:.3}}>
+        <h1 className="text-3xl font-bold">정기 구독형 법률상담, 더 쉽게.</h1>
+        <p className="mt-2 text-slate-600">연 1회 결제로 상담을 편리하게 예약하세요. 크레딧 소진 시 추가결제(시간 단위)도 지원합니다.</p>
+        <div className="mt-5 flex gap-2 flex-wrap">
+          <button onClick={()=>push('/subscribe')} className="px-5 py-3 rounded-2xl bg-black text-white hover:opacity-90 flex items-center gap-2"><CreditCard className="w-4 h-4"/> 구독 시작</button>
+          <button onClick={()=>push(user?'/consult':'/login')} className="px-5 py-3 rounded-2xl border hover:bg-slate-50 flex items-center gap-2"><MessageSquare className="w-4 h-4"/> 상담 신청</button>
+          <button onClick={()=>push('/admin')} className="px-5 py-3 rounded-2xl border hover:bg-slate-50 flex items-center gap-2"><Shield className="w-4 h-4"/> 관리자</button>
+        </div>
+        <ul className="mt-5 space-y-2 text-slate-700">
+          <li className="flex items-start gap-2"><CheckCircle2 className="w-5 h-5 mt-0.5"/> 최소 예약 간격 <b>1시간</b></li>
+          <li className="flex items-start gap-2"><CheckCircle2 className="w-5 h-5 mt-0.5"/> 취소 수수료 <b>없음</b></li>
+          <li className="flex items-start gap-2"><CheckCircle2 className="w-5 h-5 mt-0.5"/> 리마인드: <b>자정</b> / <b>1시간 전</b></li>
+        </ul>
+      </motion.div>
+      <motion.div initial={{opacity:0, y:8}} animate={{opacity:1, y:0}} transition={{duration:.35, delay:.05}}>
+        <div className="rounded-2xl border shadow-sm p-6 bg-white">
+          <div className="flex items-center gap-2 text-slate-600"><FileText className="w-4 h-4"/> 샘플 흐름</div>
+          <ol className="mt-3 space-y-2 text-slate-700 list-decimal list-inside">
+            <li>회원가입 → 로그인</li>
+            <li>서비스구독에서 요금제 선택 → NICEPAY 결제</li>
+            <li>구독 활성화 & 크레딧 지급</li>
+            <li>캘린더에서 가용 시간 선택 후 신청</li>
+            <li>관리자 확정 시 자동 블록 생성(겹침 방지)</li>
+          </ol>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+function PageSignup({push,auth}:{push:(p:string)=>void;auth:any}){
+  const {register}=auth; const [name,setName]=useState(''); const [phone,setPhone]=useState(''); const [email,setEmail]=useState(''); const [pw,setPw]=useState(''); const [pw2,setPw2]=useState(''); const [msg,setMsg]=useState(''); const [err,setErr]=useState('');
+  const onSubmit=(e:any)=>{ e.preventDefault(); setErr(''); setMsg(''); try{ if(pw!==pw2) throw new Error('비밀번호 확인 불일치'); register({name,phone,email,password:pw}); setMsg('가입 완료. 로그인 해주세요.'); setTimeout(()=>win().location.hash='/login',700);}catch(ex:any){setErr(ex.message||'실패');}};
+  return (<form onSubmit={onSubmit} className="space-y-3 max-w-lg rounded-2xl border p-6 bg-white shadow-sm">
+    <h2 className="text-xl font-bold">회원가입</h2>
+    <div className="grid sm:grid-cols-2 gap-3">
+      <input placeholder="이름" value={name} onChange={e=>setName(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+      <input placeholder="휴대폰(010-xxxx-xxxx)" value={phone} onChange={e=>setPhone(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+    </div>
+    <input type="email" placeholder="이메일" value={email} onChange={e=>setEmail(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+    <div className="grid sm:grid-cols-2 gap-3">
+      <input type="password" placeholder="비밀번호(6자 이상)" value={pw} onChange={e=>setPw(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+      <input type="password" placeholder="비밀번호 확인" value={pw2} onChange={e=>setPw2(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+    </div>
+    {err && <p className="text-sm text-red-600">{err}</p>}
+    {msg && <p className="text-sm text-green-700">{msg}</p>}
+    <button className="px-4 py-2 rounded-2xl bg-black text-white w-full">가입</button>
+  </form>);
+}
+
+function PageAuth({route,push,auth}:{route:string;push:(p:string)=>void;auth:any}){
+  const {user,login,logout}=auth; const [email,setEmail]=useState(''); const [pw,setPw]=useState(''); const [err,setErr]=useState('');
+  useEffect(()=>{ if(!user){ const prev=storage.get('route:prev','/'); storage.set('route:intended', (!prev||prev==='/login')?'/':prev);} },[user]);
+  if(route==='/logout'){ logout(); setTimeout(()=>push('/'),200); return <div className="rounded-2xl border p-6 bg-white shadow-sm">로그아웃 되었습니다.</div>; }
+  const onSubmit=(e:any)=>{ e.preventDefault(); setErr(''); try{ login(email,pw); const back=storage.get('route:intended','/')||'/'; push(back); storage.del('route:intended'); notify('login',{email}); }catch(ex:any){ setErr(ex.message||'로그인 실패'); } };
+  return (<form onSubmit={onSubmit} className="space-y-3 max-w-md rounded-2xl border p-6 bg-white shadow-sm">
+    <h2 className="text-xl font-bold">로그인</h2>
+    <input type="email" placeholder="이메일" value={email} onChange={e=>setEmail(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+    <input type="password" placeholder="비밀번호" value={pw} onChange={e=>setPw(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+    {err && <p className="text-sm text-red-600">{err}</p>}
+    <button className="px-4 py-2 rounded-2xl bg-black text-white w-full">로그인</button>
+  </form>);
+}
+
+function PageProfile({auth}:{auth:any}){
+  const {user,update}=auth; const [name,setName]=useState(user?.name||''); const [email,setEmail]=useState(user?.email||''); const [phone,setPhone]=useState(user?.phone||''); const [plan,setPlan]=useState(user?.plan||storage.get('user:plan',null)); const [msg,setMsg]=useState('');
+  if(!user) return <div>로그인이 필요합니다.</div>;
+  const onSubmit=(e:any)=>{ e.preventDefault(); const p=normalizePhone(phone); update({name,email,phone:p,plan}); storage.set('user:plan',plan); setMsg('저장됨'); notify('profile-updated',{email, plan, phone:p}); };
+  const credits = getCredits(user?.email);
+  return (<form onSubmit={onSubmit} className="space-y-3 max-w-lg rounded-2xl border p-6 bg-white shadow-sm">
+    <h2 className="text-xl font-bold">회원정보</h2>
+    <div className="grid sm:grid-cols-2 gap-3">
+      <input value={name} onChange={e=>setName(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+      <input value={email} onChange={e=>setEmail(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+    </div>
+    <input value={phone} onChange={e=>setPhone(e.target.value)} className="w-full border rounded-xl px-3 py-2"/>
+    <select value={plan||''} onChange={e=>setPlan(e.target.value)} className="w-full border rounded-xl px-3 py-2">
+      <option value="">미구독</option>
+      {PLANS.map(p=><option key={p.id} value={p.id}>{p.name} (₩{formatKRW(p.priceKRW)}/년)</option>)}
+    </select>
+    <div className="text-sm text-slate-700">보유 크레딧: <b>{credits}</b> 시간</div>
+    <button className="px-4 py-2 rounded-2xl bg-black text-white">저장</button>
+    {msg && <p className="text-sm text-green-700">{msg}</p>}
+  </form>);
+}
+
+// ---------- NICEPAY forms ----------
+function NicepayForm({plan,buyer,onReady}:{plan:any;buyer:any;onReady:(f:HTMLFormElement|null)=>void;}){
+  const ref=useRef<HTMLFormElement|null>(null);
+  useEffect(()=>{ onReady && onReady(ref.current); },[onReady]);
+  const returnUrl = isBrowser? (win().location.origin+win().location.pathname+'#/_nicepayReturn') : '#/_nicepayReturn';
+  const params:any={ MID:'winslaw00m', MOID:`SUB_${plan.id}_${Date.now()}`, GOODS:`법률상담 구독(${plan.name})`, AMOUNT:String(plan.priceKRW), BUYERNAME:buyer?.name||'게스트', BUYEREMAIL:buyer?.email||'guest@example.com', RETURNURL:returnUrl, TYPE:'SUBS' };
+  return (<form ref={ref} method="POST" action="/api/payments/nicepay/ready" className="hidden">
+    {Object.entries(params).map(([k,v])=>(<input key={k} name={String(k)} defaultValue={String(v)} readOnly/>))}
+    <input name="PLAN_ID" defaultValue={plan.id} readOnly/>
+    <input name="BILLING_CYCLE" defaultValue="ANNUAL" readOnly/>
+  </form>);
+}
+function NicepayTopupForm({email,plan,hours,onReady}:{email:string;plan:string;hours:number;onReady:(f:HTMLFormElement|null)=>void;}){
+  const ref=useRef<HTMLFormElement|null>(null);
+  useEffect(()=>{ onReady && onReady(ref.current); },[onReady]);
+  const returnUrl = isBrowser? (win().location.origin+win().location.pathname+'#/_nicepayReturn') : '#/_nicepayReturn';
+  const amount = (TOPUP_RATE[plan]||0) * hours;
+  const params:any={ MID:'winslaw00m', MOID:`TOPUP_${plan}_${Date.now()}`, GOODS:`크레딧 추가결제(${plan}, ${hours}h)`, AMOUNT:String(amount), BUYERNAME:email, BUYEREMAIL:email, RETURNURL:returnUrl, TYPE:'TOPUP', HOURS:String(hours), PLAN_ID:plan };
+  return (<form ref={ref} method="POST" action="/api/payments/nicepay/ready" className="hidden">
+    {Object.entries(params).map(([k,v])=>(<input key={k} name={String(k)} defaultValue={String(v)} readOnly/>))}
+  </form>);
+}
+
+// ---------- Subscribe Page ----------
+function PageSubscribe({auth}:{auth:any}){
+  const [sel,setSel]=useState<typeof PLANS[number]>(PLANS[1]); const [loading,setLoading]=useState(false); const [msg,setMsg]=useState(''); const formRef=useRef<HTMLFormElement|null>(null);
+  const onReady=(f:HTMLFormElement|null)=>{ formRef.current=f; };
+  const start=()=>{
+    if(!sel) return;
+    try{ setLoading(true); if(formRef.current) formRef.current.submit(); storage.set('user:pendingPlan', sel.id); setTimeout(()=>{ setLoading(false); setMsg('결제창 이동 중…'); },600);}catch{ setLoading(false); setMsg('결제를 시작하지 못했습니다.'); }
+  };
+  return (<div className="space-y-4">
+    <h2 className="text-2xl font-bold">서비스 구독</h2>
+    <div className="grid md:grid-cols-3 gap-4">
+      {PLANS.map(p=>(
+        <button key={p.id} onClick={()=>setSel(p)} className={`rounded-2xl border p-6 text-left bg-white shadow-sm hover:shadow-md ${sel.id===p.id?'ring-2 ring-black':''}`}>
+          <div className="text-lg font-semibold">{p.name} {p.badge && <span className="ml-2 text-xs px-2 py-0.5 rounded-full bg-black text-white">{p.badge}</span>}</div>
+          <div className="mt-1 text-2xl font-bold">₩ {formatKRW(p.priceKRW)}<span className="text-sm font-normal text-slate-500"> /년</span></div>
+          <div className="mt-2 text-sm text-slate-600">연간 크레딧: {PLAN_HOURS[p.id]} 시간</div>
+          <div className="mt-1 text-sm text-slate-600">추가결제: ₩ {formatKRW(TOPUP_RATE[p.id])} /시간</div>
+        </button>
+      ))}
+    </div>
+    <button disabled={loading} onClick={start} className="px-5 py-3 rounded-2xl bg-black text-white disabled:opacity-50">{loading?'준비 중…':'NICEPAY로 결제'}</button>
+    {msg && <p className="text-sm text-slate-600">{msg}</p>}
+    <NicepayForm plan={sel} buyer={auth.user} onReady={onReady}/>
+  </div>);
+}
+
 
 // ---- Types ----
 type TReq = { id:string; user:string; plan:string; createdAt:string; type:'대면'|'전화'|'텍스트'; title:string; details:string; startISO:string; endISO:string; status:'접수'|'확정'|'확정취소'|'완료'|'취소' };
